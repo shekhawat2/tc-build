@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-
 base=$(dirname "$(readlink -f "$0")")
 install=$base/install
 src=$base/src
 
-set -eu
+set -eo pipefail
 
 function parse_parameters() {
     while (($#)); do
         case $1 in
-            all | binutils | deps | kernel | llvm) action=$1 ;;
+            all | binutils | deps | cleanup | llvm | upload) action=$1 ;;
             *) exit 33 ;;
         esac
         shift
@@ -20,14 +19,15 @@ function do_all() {
     do_deps
     do_llvm
     do_binutils
-    do_kernel
+    do_cleanup
+    do_upload
 }
 
 function do_binutils() {
     "$base"/build-binutils.py \
         --install-folder "$install" \
         --show-build-commands \
-        --targets x86_64
+        --targets arm aarch64 x86_64
 }
 
 function do_deps() {
@@ -94,19 +94,68 @@ function do_llvm() {
 
     "$base"/build-llvm.py \
         --assertions \
-        --build-stage1-only \
         --build-target distribution \
         --check-targets clang lld llvm \
         --install-folder "$install" \
         --install-target distribution \
         --projects clang lld \
         --quiet-cmake \
-        --ref release/17.x \
         --shallow-clone \
         --show-build-commands \
-        --targets X86 \
+        --vendor-string "KCUF" \
+        --targets ARM AArch64 X86 \
+        --lto thin \
+        --defines LLVM_PARALLEL_COMPILE_JOBS=$(nproc) LLVM_PARALLEL_LINK_JOBS=$(nproc) CMAKE_C_FLAGS=-O3 CMAKE_CXX_FLAGS=-O3 \
         "${extra_args[@]}"
 }
 
-parse_parameters "$@"
+function do_cleanup() {
+    # Remove unused products
+    rm -fr $install/include
+    rm -f $install/lib/*.a $install/lib/*.la
+
+    # Strip remaining products
+    for f in $(find $install -type f -exec file {} \; | grep 'not stripped' | awk '{print $1}'); do
+        strip "${f::-1}"
+    done
+
+    # Set executable rpaths so setting LD_LIBRARY_PATH isn't necessary
+    for bin in $(find $install -mindepth 2 -maxdepth 3 -type f -exec file {} \; | grep 'ELF .* interpreter' | awk '{print $1}'); do
+        # Remove last character from file output (':')
+        bin="${bin::-1}"
+
+        echo "$bin"
+        patchelf --set-rpath "$ORIGIN/../lib" "$bin"
+    done
+}
+
+function do_upload() {
+    git config --global user.name "Anand Shekhawat"
+    git config --global user.email "anandsingh215@yahoo.com"
+    ssh-keyscan -t rsa -p 22 -H gitlab.com 2>&1 | tee -a ~/.ssh/known_hosts
+
+    rel_date="$(date "+%Y%m%d")" # ISO 8601 format
+    builder_commit="$(git rev-parse HEAD)"
+    pushd $src/llvm-project
+    llvm_commit="$(git rev-parse HEAD)"
+    popd
+    llvm_commit_url="https://github.com/llvm/llvm-project/commit/$llvm_commit"
+    binutils_ver="$(ls $src | grep "^binutils-" | sed "s/binutils-//g" | head -1)"
+    rm -rf rel_repo
+    git clone git@gitlab.com:shekhawat2/clang-builds.git $base/rel_repo
+
+    pushd $base/rel_repo
+    rm -rf ./*
+    cp -r ../install/* .
+    git add .
+    git commit -am "Update to $rel_date build
+
+    LLVM commit: $llvm_commit_url
+    binutils version: $binutils_ver
+    Builder commit: https://github.com/shekhawat2/tc-build/commit/$builder_commit"
+    git push
+    popd
+}
+
+parse_parameters "${@}"
 do_"${action:=all}"
