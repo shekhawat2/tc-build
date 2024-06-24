@@ -20,7 +20,6 @@ function do_all() {
     do_llvm
     do_binutils
     do_cleanup
-    do_upload
 }
 
 function do_binutils() {
